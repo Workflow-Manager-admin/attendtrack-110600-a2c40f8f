@@ -1,39 +1,48 @@
 import os
+import json
 from fastapi import FastAPI, Depends, HTTPException, status, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship, Session
-from pydantic import BaseModel, Field
 from typing import Optional
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from datetime import datetime, timedelta
-
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from threading import Lock
 
-# Load environment variables from .env file for DB connection
+# Load environment variables from .env file for secret key
 load_dotenv()
 
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+DATA_FILE = os.path.join(DATA_DIR, "attendance_data.json")
+
+# Thread lock for concurrent file access
+_json_lock = Lock()
+
+def ensure_data_file():
+    """Ensures that the data file exists and is initialized if necessary."""
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w") as f:
+            json.dump({"users": [], "attendance": [], "user_counter": 1, "attendance_counter": 1}, f)
+ensure_data_file()
+
 # PUBLIC_INTERFACE
-def get_database_url():
-    """Get the database URL from environment variables for SQLAlchemy connection."""
-    # Reference to attendance_database connection string
-    db_url = os.getenv("ATTENDANCE_DATABASE_URL")
-    if db_url is None:
-        raise RuntimeError("ATTENDANCE_DATABASE_URL not set in environment")
-    return db_url
+def read_data():
+    """Safely loads user and attendance data from the JSON file."""
+    with _json_lock:
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
 
-SQLALCHEMY_DATABASE_URL = get_database_url()
+# PUBLIC_INTERFACE
+def write_data(data):
+    """Safely writes user and attendance data to the JSON file."""
+    with _json_lock:
+        with open(DATA_FILE, "w") as f:
+            json.dump(data, f, default=str, indent=2)
 
-# SQLAlchemy setup
-engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True, future=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# --- Authentication Config & Utility Functions ---
-
-SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "changeme_please")  # Replace in .env in production!
+# Authentication config
+SECRET_KEY = os.getenv("AUTH_SECRET_KEY", "changeme_please")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -72,34 +81,7 @@ def decode_access_token(token: str) -> dict:
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-# Database Models
-
-# PUBLIC_INTERFACE
-class User(Base):
-    """Database model representing a user of the attendance system."""
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True)
-    username = Column(String, unique=True, index=True, nullable=False)
-    full_name = Column(String, nullable=False)
-    hashed_password = Column(String, nullable=False)
-    email = Column(String, unique=True, index=True, nullable=False)
-    is_active = Column(Integer, default=1)
-    # Relationship to attendance records
-    attendance_records = relationship("AttendanceRecord", back_populates="user")
-
-# PUBLIC_INTERFACE
-class AttendanceRecord(Base):
-    """Database model representing an attendance record entry."""
-    __tablename__ = "attendance_records"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    status = Column(String, nullable=False)  # e.g. "check-in", "check-out"
-    note = Column(String, nullable=True)
-
-    user = relationship("User", back_populates="attendance_records")
-
-# Pydantic Schemas
+# --- Pydantic Schemas ---
 
 # PUBLIC_INTERFACE
 class UserBase(BaseModel):
@@ -159,35 +141,48 @@ class AttendanceRecordRead(AttendanceRecordBase):
     class Config:
         from_attributes = True
 
-# Dependency for FastAPI routes
+# --- Data Access Helper Functions ---
 
 # PUBLIC_INTERFACE
-def get_db():
-    """Yield a database session to be used in FastAPI routes."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-# --- Authentication Route Dependencies & Logic ---
+def get_user_by_username(username: str) -> Optional[dict]:
+    """Return the user dict by username, or None if not found."""
+    data = read_data()
+    for user in data["users"]:
+        if user["username"] == username:
+            return user
+    return None
 
 # PUBLIC_INTERFACE
-def get_user_by_username(db: Session, username: str) -> Optional[User]:
-    """Return a User by username if exists, else None."""
-    return db.query(User).filter(User.username == username).first()
+def get_user_by_email(email: str) -> Optional[dict]:
+    """Return the user dict by email, or None if not found."""
+    data = read_data()
+    for user in data["users"]:
+        if user["email"] == email:
+            return user
+    return None
 
 # PUBLIC_INTERFACE
-def authenticate_user(db: Session, username: str, password: str) -> Optional[User]:
-    """Verify user credentials; return User if successful, else None."""
-    user = get_user_by_username(db, username=username)
-    if user and verify_password(password, user.hashed_password):
+def get_user_by_id(user_id: int) -> Optional[dict]:
+    """Return the user dict by ID, or None if not found."""
+    data = read_data()
+    for user in data["users"]:
+        if user["id"] == user_id:
+            return user
+    return None
+
+# PUBLIC_INTERFACE
+def authenticate_user(username: str, password: str) -> Optional[dict]:
+    """Verify user credentials; return user dict if successful, else None."""
+    user = get_user_by_username(username)
+    if user and verify_password(password, user["hashed_password"]):
         return user
     return None
 
 # PUBLIC_INTERFACE
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """Dependency that gets current logged-in user from the Authorization Bearer JWT."""
+def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    """
+    Dependency that gets current logged-in user from the Authorization Bearer JWT.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials (token missing/invalid)",
@@ -201,15 +196,86 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         token_data = TokenData(username=username)
     except JWTError:
         raise credentials_exception
-    user = get_user_by_username(db, username=token_data.username)
+    user = get_user_by_username(token_data.username)
     if user is None:
         raise credentials_exception
     return user
+
+def user_to_userread(user: dict) -> UserRead:
+    """Convert raw user dict to UserRead."""
+    return UserRead(
+        id=user["id"],
+        username=user["username"],
+        full_name=user["full_name"],
+        email=user["email"],
+    )
+
+def attendance_to_read(record: dict) -> AttendanceRecordRead:
+    """Convert raw attendance dict to AttendanceRecordRead."""
+    return AttendanceRecordRead(
+        id=record["id"],
+        user_id=record["user_id"],
+        status=record["status"],
+        note=record.get("note"),
+        timestamp=datetime.fromisoformat(record["timestamp"]),
+    )
+
+def get_latest_attendance_for_user(user_id: int) -> Optional[dict]:
+    """Get the most recent attendance record for a user, if present."""
+    data = read_data()
+    records = [rec for rec in data["attendance"] if rec["user_id"] == user_id]
+    if not records:
+        return None
+    return max(records, key=lambda rec: rec["timestamp"])
+
+def add_user(user_data: UserCreate) -> dict:
+    """Add new user; returns user dict."""
+    data = read_data()
+    user_id = data.get("user_counter", 1)
+    hashed_pwd = get_password_hash(user_data.password)
+    user_dict = {
+        "id": user_id,
+        "username": user_data.username,
+        "full_name": user_data.full_name,
+        "email": user_data.email,
+        "hashed_password": hashed_pwd,
+        "is_active": 1
+    }
+    data["users"].append(user_dict)
+    data["user_counter"] = user_id + 1
+    write_data(data)
+    # Return without password hash
+    ret = user_dict.copy()
+    ret.pop("hashed_password")
+    return user_dict
+
+def add_attendance_record(user_id: int, status: str, note: Optional[str]) -> dict:
+    """Add attendance record for user and return dict."""
+    data = read_data()
+    record_id = data.get("attendance_counter", 1)
+    now_str = datetime.utcnow().isoformat()
+    record_dict = {
+        "id": record_id,
+        "user_id": user_id,
+        "status": status,
+        "timestamp": now_str,
+        "note": note,
+    }
+    data["attendance"].append(record_dict)
+    data["attendance_counter"] = record_id + 1
+    write_data(data)
+    return record_dict
+
+# -- FastAPI App and Routes --
 
 app = FastAPI(
     title="Attendance Tracking API",
     description="FastAPI backend for attendance management, user authentication, and attendance records.",
     version="0.1.0",
+    openapi_tags=[
+        {"name": "Authentication", "description": "User registration, login, and profile."},
+        {"name": "Attendance", "description": "Check-in and check-out attendance endpoints."}
+    ]
 )
 
 app.add_middleware(
@@ -224,12 +290,6 @@ app.add_middleware(
 def health_check():
     """Health check endpoint for service status."""
     return {"message": "Healthy"}
-
-# Initial migration logic (creates tables on startup if not present)
-@app.on_event("startup")
-def on_startup():
-    """Create database tables if they do not exist, resembling a simple migration."""
-    Base.metadata.create_all(bind=engine)
 
 # ------------------------ AUTH ROUTES ------------------------ #
 
@@ -253,27 +313,12 @@ Register a new user by providing a unique username, email, full name, and passwo
 # PUBLIC_INTERFACE
 def register_user(
     user: UserCreate = Body(..., description="User registration data"),
-    db: Session = Depends(get_db),
 ):
     # Check for duplicate username or email
-    duplicate_user = db.query(User).filter(
-        (User.username == user.username) | (User.email == user.email)
-    ).first()
-    if duplicate_user:
+    if get_user_by_username(user.username) or get_user_by_email(user.email):
         raise HTTPException(status_code=409, detail="Username or email is already registered.")
-    # Hash password and create new user
-    hashed_pwd = get_password_hash(user.password)
-    db_user = User(
-        username=user.username,
-        full_name=user.full_name,
-        email=user.email,
-        hashed_password=hashed_pwd,
-        is_active=1
-    )
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    return db_user
+    user_dict = add_user(user)
+    return user_to_userread(user_dict)
 
 @app.post(
     "/login",
@@ -293,22 +338,19 @@ Authenticate a registered user and obtain a JWT access token for API access.
 )
 # PUBLIC_INTERFACE
 def login_for_access_token(
-    form_data: OAuth2PasswordRequestForm = Depends(),
-    db: Session = Depends(get_db)
+    form_data: OAuth2PasswordRequestForm = Depends()
 ):
-    user = authenticate_user(db, username=form_data.username, password=form_data.password)
+    user = authenticate_user(form_data.username, form_data.password)
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    # Generate JWT token with user identification
-    token_data = {"sub": user.username}
+    token_data = {"sub": user["username"]}
     access_token = create_access_token(data=token_data)
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Example: protected endpoint (shows how to use get_current_user dependency)
 @app.get(
     "/me",
     response_model=UserRead,
@@ -318,9 +360,9 @@ def login_for_access_token(
     responses={401: {"description": "Not authenticated."}},
 )
 def read_users_me(
-    current_user: User = Depends(get_current_user)
+    current_user: dict = Depends(get_current_user)
 ):
-    return current_user
+    return user_to_userread(current_user)
 
 # -------------------- END AUTH ROUTES -------------------- #
 
@@ -344,34 +386,23 @@ Prevents repeat check-ins without checking out. Requires valid Bearer JWT token.
 # PUBLIC_INTERFACE
 def check_in_attendance(
     note: Optional[str] = Body(None, description="Optional note"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Check in the logged-in user.
     - Requires JWT authentication.
     - Prevents check-in if user's latest attendance record is 'check-in' and no matching 'check-out'.
     """
-    # Get latest attendance record for user
-    latest_record = (
-        db.query(AttendanceRecord)
-        .filter(AttendanceRecord.user_id == current_user.id)
-        .order_by(AttendanceRecord.timestamp.desc())
-        .first()
-    )
-    if latest_record is not None and latest_record.status == "check-in":
+    user_id = current_user["id"]
+    latest_record = get_latest_attendance_for_user(user_id)
+    if latest_record is not None and latest_record["status"] == "check-in":
         raise HTTPException(status_code=409, detail="User already checked in and not checked out.")
-    # Create a new check-in record
-    record = AttendanceRecord(
-        user_id=current_user.id,
+    record = add_attendance_record(
+        user_id=user_id,
         status="check-in",
-        timestamp=datetime.utcnow(),
         note=note,
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return record
+    return attendance_to_read(record)
 
 @app.post(
     "/attendance/check-out",
@@ -391,8 +422,7 @@ User must check in first before checking out. Requires valid Bearer JWT token.
 # PUBLIC_INTERFACE
 def check_out_attendance(
     note: Optional[str] = Body(None, description="Optional note"),
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
     """
     Check out the logged-in user.
@@ -400,24 +430,17 @@ def check_out_attendance(
     - Requires that user's latest attendance record is a 'check-in'.
     - Prevents check-out before check-in.
     """
-    latest_record = (
-        db.query(AttendanceRecord)
-        .filter(AttendanceRecord.user_id == current_user.id)
-        .order_by(AttendanceRecord.timestamp.desc())
-        .first()
-    )
-    if latest_record is None or latest_record.status != "check-in":
+    user_id = current_user["id"]
+    latest_record = get_latest_attendance_for_user(user_id)
+    if latest_record is None or latest_record["status"] != "check-in":
         raise HTTPException(status_code=409, detail="User must check in before checking out.")
-    # Create a new check-out record
-    record = AttendanceRecord(
-        user_id=current_user.id,
+    record = add_attendance_record(
+        user_id=user_id,
         status="check-out",
-        timestamp=datetime.utcnow(),
         note=note,
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return record
+    return attendance_to_read(record)
 
-# ------------------- END ATTENDANCE ROUTES ------------------- #
+# Optionally, add history/report endpoints here!
+
+# No DB startup needed for file-based backend now
