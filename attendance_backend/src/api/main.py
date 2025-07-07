@@ -118,7 +118,7 @@ class Token(BaseModel):
 # PUBLIC_INTERFACE
 class TokenData(BaseModel):
     """Structured user data from JWT token after decoding."""
-    username: str = Field(..., description="Username (subject)", default=None)
+    username: str = Field(None, description="Username (subject)")
 
 # PUBLIC_INTERFACE
 class AttendanceRecordBase(BaseModel):
