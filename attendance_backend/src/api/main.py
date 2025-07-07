@@ -323,3 +323,101 @@ def read_users_me(
     return current_user
 
 # -------------------- END AUTH ROUTES -------------------- #
+
+# ------------------- ATTENDANCE ROUTES ------------------- #
+
+@app.post(
+    "/attendance/check-in",
+    response_model=AttendanceRecordRead,
+    tags=["Attendance"],
+    summary="Mark attendance as check-in (requires JWT)",
+    description="""
+Record a check-in event for the authenticated user with the current UTC timestamp.
+Prevents repeat check-ins without checking out. Requires valid Bearer JWT token.
+""",
+    responses={
+        200: {"description": "Successfully checked in"},
+        401: {"description": "Not authenticated"},
+        409: {"description": "Already checked in (must check out first)"},
+    }
+)
+# PUBLIC_INTERFACE
+def check_in_attendance(
+    note: Optional[str] = Body(None, description="Optional note"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Check in the logged-in user.
+    - Requires JWT authentication.
+    - Prevents check-in if user's latest attendance record is 'check-in' and no matching 'check-out'.
+    """
+    # Get latest attendance record for user
+    latest_record = (
+        db.query(AttendanceRecord)
+        .filter(AttendanceRecord.user_id == current_user.id)
+        .order_by(AttendanceRecord.timestamp.desc())
+        .first()
+    )
+    if latest_record is not None and latest_record.status == "check-in":
+        raise HTTPException(status_code=409, detail="User already checked in and not checked out.")
+    # Create a new check-in record
+    record = AttendanceRecord(
+        user_id=current_user.id,
+        status="check-in",
+        timestamp=datetime.utcnow(),
+        note=note,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+@app.post(
+    "/attendance/check-out",
+    response_model=AttendanceRecordRead,
+    tags=["Attendance"],
+    summary="Mark attendance as check-out (requires JWT)",
+    description="""
+Record a check-out event for the authenticated user with the current UTC timestamp.
+User must check in first before checking out. Requires valid Bearer JWT token.
+""",
+    responses={
+        200: {"description": "Successfully checked out"},
+        401: {"description": "Not authenticated"},
+        409: {"description": "User must check in before checking out"},
+    }
+)
+# PUBLIC_INTERFACE
+def check_out_attendance(
+    note: Optional[str] = Body(None, description="Optional note"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Check out the logged-in user.
+    - Requires JWT authentication.
+    - Requires that user's latest attendance record is a 'check-in'.
+    - Prevents check-out before check-in.
+    """
+    latest_record = (
+        db.query(AttendanceRecord)
+        .filter(AttendanceRecord.user_id == current_user.id)
+        .order_by(AttendanceRecord.timestamp.desc())
+        .first()
+    )
+    if latest_record is None or latest_record.status != "check-in":
+        raise HTTPException(status_code=409, detail="User must check in before checking out.")
+    # Create a new check-out record
+    record = AttendanceRecord(
+        user_id=current_user.id,
+        status="check-out",
+        timestamp=datetime.utcnow(),
+        note=note,
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+# ------------------- END ATTENDANCE ROUTES ------------------- #
